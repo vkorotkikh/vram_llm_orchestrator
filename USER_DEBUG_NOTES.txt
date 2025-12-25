@@ -1,0 +1,128 @@
+Something is really wrong with how the model layers are allocated to each GPU. I jsut attempted the following command with mmap disabled and smaller context size.
+python -m vram_llm serve   --model /home/nomad/models/models/nemotron49b-q8/nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q8_0/nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q8_0-00001-of-00002.gguf   --no-mmap   --n-ctx 2048
+
+See this error:
+
+load_tensors: layer  80 assigned to device CUDA2, is_swa = 0
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 27682.28 MiB on device 0: cudaMalloc failed: out of memory
+alloc_tensor_range: failed to allocate CUDA0 buffer of size 29026976000
+llama_model_load: error loading model: unable to allocate CUDA0 buffer
+llama_model_load_from_file_impl: failed to load model
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/nomad/Documents/vram_llm_orchestrator_poc/vram_llm/__main__.py", line 4, in <module>
+    main()
+  File "/home/nomad/Documents/vram_llm_orchestrator_poc/vram_llm/cli.py", line 219, in main
+    raise SystemExit(cmd_serve(args))
+                     ^^^^^^^^^^^^^^^
+  File "/home/nomad/Documents/vram_llm_orchestrator_poc/vram_llm/cli.py", line 193, in cmd_serve
+    engine.load(
+  File "/home/nomad/Documents/vram_llm_orchestrator_poc/vram_llm/engines/llama_cpp_engine.py", line 115, in load
+    llama = Llama(
+            ^^^^^^
+  File "/home/nomad/miniconda3/envs/vram_llm/lib/python3.11/site-packages/llama_cpp/llama.py", line 374, in __init__
+    internals.LlamaModel(
+  File "/home/nomad/miniconda3/envs/vram_llm/lib/python3.11/site-packages/llama_cpp/_internals.py", line 58, in __init__
+    raise ValueError(f"Failed to load model from file: {path_model}")
+ValueError: Failed to load model from file: /home/nomad/models/models/nemotron49b-q8/nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q8_0/nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q8_0-00001-of-00002.gguf
+Exception ignored in: <function LlamaModel.__del__ at 0x7c2d18104680>
+Traceback (most recent call last):
+  File "/home/nomad/miniconda3/envs/vram_llm/lib/python3.11/site-packages/llama_cpp/_internals.py", line 86, in __del__
+    self.close()
+  File "/home/nomad/miniconda3/envs/vram_llm/lib/python3.11/site-packages/llama_cpp/_internals.py", line 78, in close
+    if self.sampler is not None:
+       ^^^^^^^^^^^^
+AttributeError: 'LlamaModel' object has no attribute 'sampler'
+
+What am I relying on in this to perform calculations for layer allocation, is it llama_cpp? The calculations for layer allocation are all wrong. There is no way a 24GB 3090 Ti should be allocated 29GB of layers.
+
+We need to add our own custom logic to perform layer allocation per GPU.
+- is there a way to determine the size of each layer in VRAM?
+- this allocation math is incorrect, one 3090 TI gets 34 layers assigned to it, the other 31. CUDA2 which i assume is RTX 4080 mobile 12GB VRAM gets only 14 layers.
+
+Layer assignment log:
+
+load_tensors: loading model tensors, this can take a while... (mmap = false)
+load_tensors: layer   0 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   1 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   2 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   3 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   4 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   5 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   6 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   7 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   8 assigned to device CUDA0, is_swa = 0
+load_tensors: layer   9 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  10 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  11 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  12 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  13 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  14 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  15 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  16 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  17 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  18 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  19 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  20 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  21 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  22 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  23 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  24 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  25 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  26 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  27 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  28 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  29 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  30 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  31 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  32 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  33 assigned to device CUDA0, is_swa = 0
+load_tensors: layer  34 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  35 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  36 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  37 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  38 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  39 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  40 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  41 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  42 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  43 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  44 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  45 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  46 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  47 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  48 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  49 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  50 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  51 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  52 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  53 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  54 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  55 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  56 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  57 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  58 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  59 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  60 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  61 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  62 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  63 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  64 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  65 assigned to device CUDA1, is_swa = 0
+load_tensors: layer  66 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  67 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  68 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  69 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  70 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  71 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  72 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  73 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  74 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  75 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  76 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  77 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  78 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  79 assigned to device CUDA2, is_swa = 0
+load_tensors: layer  80 assigned to device CUDA2, is_swa = 0
+
