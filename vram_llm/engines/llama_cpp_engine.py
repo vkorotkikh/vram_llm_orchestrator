@@ -82,11 +82,36 @@ class LlamaCppEngine:
             tensor_split = []
         else:
             # Normalize tensor_split to proportions (sum to 1.0)
-            # llama.cpp expects relative weights, but normalizing ensures consistent behavior
             total = sum(tensor_split)
             tensor_split = [w / total for w in tensor_split]
+            
+            # IMPORTANT: Apply correction factors for VRAM overhead
+            # - KV cache takes ~500MB-2GB per GPU depending on context
+            # - Compute buffers take ~400MB per GPU
+            # - Early layers (on GPU 0) are typically 20-30% larger than average
+            # 
+            # We reduce GPU 0's proportion to account for:
+            # 1. Larger early layers (embeddings, first attention blocks)
+            # 2. Additional overhead that accumulates on main_gpu
+            if len(tensor_split) > 1:
+                # Reserve extra headroom for GPU 0 (early layers are bigger)
+                # Reduce GPU 0 by 15%, redistribute to other GPUs
+                early_layer_penalty = 0.15
+                reduction = tensor_split[0] * early_layer_penalty
+                tensor_split[0] -= reduction
+                
+                # Distribute the reduction to other GPUs proportionally
+                remaining_total = sum(tensor_split[1:])
+                if remaining_total > 0:
+                    for i in range(1, len(tensor_split)):
+                        tensor_split[i] += reduction * (tensor_split[i] / remaining_total)
+                
+                # Re-normalize to ensure sum is exactly 1.0
+                total = sum(tensor_split)
+                tensor_split = [w / total for w in tensor_split]
+            
             if verbose:
-                print(f"[vram-llm] normalized tensor_split: {tensor_split}")
+                print(f"[vram-llm] adjusted tensor_split (with early-layer compensation): {tensor_split}")
 
         # In row-split mode, llama.cpp may keep some allocations on main_gpu.
         # For heterogeneous GPUs, it's generally safer to keep the biggest-free GPU first (CUDA device 0),
