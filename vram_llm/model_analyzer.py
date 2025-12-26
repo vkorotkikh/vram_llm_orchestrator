@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import os
+from typing import Optional
 
 
 # GGUF format constants
@@ -52,6 +53,16 @@ class TensorInfo:
     name: str
     size_bytes: int
     layer_index: Optional[int]  # None if not a layer tensor (e.g., embeddings)
+
+
+@dataclass
+class TorchGPUStats:
+    """Lightweight snapshot of a CUDA device via torch.cuda."""
+    index: int
+    name: str
+    total_mib: int
+    free_mib: int
+    used_mib: int
     
 
 @dataclass
@@ -120,6 +131,27 @@ class ModelAnalysis:
         
         return tensor_split, layers_per_gpu
 
+    def get_torch_based_distribution(
+        self,
+        reserve_mib: int = 512,
+        devices: Optional[list[int]] = None,
+    ) -> tuple[list[float], list[int], list[TorchGPUStats]]:
+        """
+        Calculate layer distribution using torch.cuda for live GPU free memory.
+
+        Returns empty lists if torch is unavailable or no CUDA GPUs are visible.
+        """
+        gpus = _list_torch_gpus(devices)
+        if not gpus:
+            return [], [], []
+
+        gpu_budgets = [g.free_mib for g in gpus]
+        tensor_split, layers_per_gpu = self.get_layer_distribution(
+            gpu_budgets_mib=gpu_budgets,
+            reserve_mib=reserve_mib,
+        )
+        return tensor_split, layers_per_gpu, gpus
+
 
 def _read_string(f) -> str:
     """Read a GGUF string (length-prefixed)."""
@@ -166,6 +198,53 @@ def _read_metadata_uint32(f, value_type: int) -> Optional[int]:
         return struct.unpack('<I', f.read(4))[0]
     _skip_metadata_value(f, value_type)
     return None
+
+
+def _bytes_to_mib(v: int) -> int:
+    return int(v // (1024 * 1024))
+
+
+def _list_torch_gpus(devices: Optional[list[int]] = None) -> list[TorchGPUStats]:
+    """List GPUs using torch.cuda (per-process free memory)."""
+    try:
+        import torch
+    except Exception:
+        return []
+
+    try:
+        if not torch.cuda.is_available():
+            return []
+        count = torch.cuda.device_count()
+    except Exception:
+        return []
+
+    indices = list(range(count))
+    if devices is not None:
+        indices = [i for i in devices if 0 <= i < count]
+
+    gpus: list[TorchGPUStats] = []
+    for idx in indices:
+        try:
+            with torch.cuda.device(idx):
+                free_b, total_b = torch.cuda.mem_get_info()
+            props = torch.cuda.get_device_properties(idx)
+        except Exception:
+            continue
+
+        total_mib = _bytes_to_mib(int(total_b))
+        free_mib = _bytes_to_mib(int(free_b))
+        used_mib = max(0, total_mib - free_mib)
+
+        gpus.append(
+            TorchGPUStats(
+                index=idx,
+                name=str(props.name),
+                total_mib=total_mib,
+                free_mib=free_mib,
+                used_mib=used_mib,
+            )
+        )
+    return gpus
 
 
 def analyze_gguf_model(model_path: str) -> ModelAnalysis:
@@ -297,12 +376,26 @@ if __name__ == "__main__":
         print("Usage: python -m vram_llm.model_analyzer <model.gguf>")
         sys.exit(1)
     
+    reserve_mib = int(os.environ.get("VRAM_LLM_RESERVE_MIB", "512"))
     analysis = analyze_gguf_model(sys.argv[1])
     print_model_analysis(analysis)
     
-    # Example: calculate distribution for 3 GPUs with different budgets
-    gpu_budgets = [24000, 24000, 12000]  # MiB
-    tensor_split, layers_per_gpu = analysis.get_layer_distribution(gpu_budgets)
-    print(f"\n  Suggested tensor_split for GPUs {gpu_budgets}: {tensor_split}")
-    print(f"  Layers per GPU: {layers_per_gpu}")
-
+    # If torch is available, show a split based on live CUDA free memory.
+    torch_split, torch_layers_per_gpu, torch_gpus = analysis.get_torch_based_distribution(
+        reserve_mib=reserve_mib
+    )
+    if torch_gpus:
+        print(f"\n  PyTorch CUDA snapshot (reserve {reserve_mib} MiB per GPU):")
+        for g, layers in zip(torch_gpus, torch_layers_per_gpu):
+            print(f"    GPU {g.index} ({g.name}): free {g.free_mib} / total {g.total_mib} MiB -> {layers} layers")
+        print(f"  tensor_split: {[round(t, 3) for t in torch_split]}")
+    else:
+        # Fallback example: fixed budgets to illustrate usage.
+        gpu_budgets = [24000, 24000, 12000]  # MiB
+        tensor_split, layers_per_gpu = analysis.get_layer_distribution(
+            gpu_budgets,
+            reserve_mib=reserve_mib,
+        )
+        print(f"\n  (Torch not available; using example budgets {gpu_budgets})")
+        print(f"  Suggested tensor_split: {tensor_split}")
+        print(f"  Layers per GPU: {layers_per_gpu}")
