@@ -400,17 +400,27 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     n_layers = max(n_layers_meta, max_layer_seen + 1)
     
     # Aggregate by layer after we know layer count
+    # layer_sizes[i] holds the total bytes for all tensors that belong to layer i
     layer_sizes = [0] * n_layers if n_layers > 0 else []
+    layer_counts = [0] * n_layers if n_layers > 0 else []
     embedding_size = 0
     output_size = 0
     
     for t in tensors:
         if t.layer_index is not None and 0 <= t.layer_index < len(layer_sizes):
             layer_sizes[t.layer_index] += t.size_bytes
+            layer_counts[t.layer_index] += 1
         elif 'embed' in t.name.lower() or 'token_embd' in t.name.lower():
             embedding_size += t.size_bytes
         elif 'output' in t.name.lower() or 'lm_head' in t.name.lower():
             output_size += t.size_bytes
+
+    # Log per-layer totals to make it easy to eyeball allocation candidates
+    for idx, size_bytes in enumerate(layer_sizes):
+        size_mb = size_bytes / (1024 * 1024)
+        logger.info("Layer %d total: %.2f MB (%d tensors)", idx, size_mb, layer_counts[idx])
+    logger.info("Embeddings total: %.2f MB", embedding_size / (1024 * 1024))
+    logger.info("Output head total: %.2f MB", output_size / (1024 * 1024))
     
     total_size = sum(t.size_bytes for t in tensors)
     avg_layer_size = sum(layer_sizes) // len(layer_sizes) if layer_sizes else 0
