@@ -84,52 +84,74 @@ class ModelAnalysis:
     ) -> tuple[list[float], list[int]]:
         """
         Calculate optimal layer distribution across GPUs.
-        
+
+        GPUs are first ordered by available budget (largest first) so GPU 0 is the
+        biggest. We then fill each GPU sequentially: pack as many layers as fit on
+        GPU 0, move to GPU 1 when it cannot fit the next layer, and so on. If the
+        total model (layers + embeddings + output) cannot fit after reserve, a
+        best-effort placement is still returned.
+
         Returns:
-            tensor_split: Normalized proportions for each GPU
-            layers_per_gpu: Number of layers assigned to each GPU
+            tensor_split: Normalized proportions for each GPU (in the sorted order)
+            layers_per_gpu: Number of layers assigned to each GPU (same order)
         """
+        logger = logging.getLogger(__name__)
         n_gpus = len(gpu_budgets_mib)
         if n_gpus == 0:
             return [], []
-        
-        # Convert budgets to bytes, accounting for reserve
-        budgets_bytes = [(b - reserve_mib) * 1024 * 1024 for b in gpu_budgets_mib]
-        
+
+        # Convert budgets to bytes, accounting for reserve, and clamp at 0
+        budgets_bytes = [max(0, (b - reserve_mib) * 1024 * 1024) for b in gpu_budgets_mib]
+
+        # Quick feasibility check using total capacity after reserve
+        total_required = sum(self.layer_sizes) + self.embedding_size + self.output_size
+        total_available = sum(budgets_bytes)
+        if total_required > total_available:
+            logger.warning(
+                "Model requires %.2f GiB (layers + embeddings/output) but only %.2f GiB "
+                "VRAM available after reserve; allocation will oversubscribe.",
+                total_required / (1024**3),
+                total_available / (1024**3),
+            )
+
+        # Order GPUs by available budget so GPU 0 is the largest
+        order = sorted(range(n_gpus), key=lambda i: budgets_bytes[i], reverse=True)
+        budgets_bytes = [budgets_bytes[i] for i in order]
+
         # GPU 0 also holds embeddings and output layer, reduce its budget
         overhead_gpu0 = self.embedding_size + self.output_size
         budgets_bytes[0] = max(0, budgets_bytes[0] - overhead_gpu0)
-        
-        # Greedily assign layers to GPUs
+
         layers_per_gpu = [0] * n_gpus
         remaining_budget = list(budgets_bytes)
-        
+
+        # Sequentially pack layers: fill GPU 0, then GPU 1, etc.
         current_gpu = 0
-        for layer_idx, layer_size in enumerate(self.layer_sizes):
-            # Find a GPU with enough budget
-            assigned = False
-            for attempt in range(n_gpus):
-                gpu = (current_gpu + attempt) % n_gpus
-                if remaining_budget[gpu] >= layer_size:
-                    layers_per_gpu[gpu] += 1
-                    remaining_budget[gpu] -= layer_size
-                    current_gpu = gpu
-                    assigned = True
+        for layer_size in self.layer_sizes:
+            placed = False
+
+            while current_gpu < n_gpus:
+                if remaining_budget[current_gpu] >= layer_size:
+                    layers_per_gpu[current_gpu] += 1
+                    remaining_budget[current_gpu] -= layer_size
+                    placed = True
                     break
-            
-            if not assigned:
-                # No GPU has enough space - assign to GPU with most remaining
-                gpu = remaining_budget.index(max(remaining_budget))
-                layers_per_gpu[gpu] += 1
-                remaining_budget[gpu] -= layer_size
-        
+                current_gpu += 1
+
+            if not placed:
+                # Best-effort fallback: pick the GPU with the most remaining space
+                fallback_gpu = remaining_budget.index(max(remaining_budget))
+                layers_per_gpu[fallback_gpu] += 1
+                remaining_budget[fallback_gpu] -= layer_size
+                current_gpu = fallback_gpu
+
         # Calculate tensor_split proportions based on actual assigned layers
         total_layers = sum(layers_per_gpu)
         if total_layers == 0:
             return [1.0 / n_gpus] * n_gpus, [0] * n_gpus
-        
+
         tensor_split = [l / total_layers for l in layers_per_gpu]
-        
+
         return tensor_split, layers_per_gpu
 
     def get_torch_based_distribution(
