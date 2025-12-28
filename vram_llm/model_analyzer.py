@@ -8,6 +8,7 @@ Reads GGUF metadata to determine:
 """
 from __future__ import annotations
 
+import logging
 import re
 import struct
 from dataclasses import dataclass
@@ -231,6 +232,23 @@ def _resolve_multipart_paths(path: Path) -> list[Path]:
     return parts
 
 
+def _layer_logger() -> logging.Logger:
+    """File logger dedicated to layer-size aggregation and header details."""
+    default_path = Path(__file__).resolve().parent / "layer_sizes.log"
+    log_path = Path(os.environ.get("VRAM_LLM_LAYER_LOG", str(default_path)))
+
+    logger = logging.getLogger("vram_llm.layer_sizes")
+    if not logger.handlers:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.info("Layer size log started: %s", log_path)
+    return logger
+
+
 def _list_torch_gpus(devices: Optional[list[int]] = None) -> list[TorchGPUStats]:
     """List GPUs using torch.cuda (per-process free memory)."""
     try:
@@ -282,6 +300,10 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     """
     path = Path(model_path).expanduser().resolve()
     paths = _resolve_multipart_paths(path)
+    logger = _layer_logger()
+    log_path = getattr(logger.handlers[0], "baseFilename", "layer_sizes.log") if logger.handlers else "layer_sizes.log"
+    logger.info("Analyzing GGUF parts: %s", ", ".join(p.name for p in paths))
+    print(f"[vram-llm] analyzing {len(paths)} GGUF part(s); detailed log -> {log_path}")
     
     # Collect tensor information
     tensors: list[TensorInfo] = []
@@ -289,14 +311,22 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     
     for part_path in paths:
         with open(part_path, 'rb') as f:
-            # Read header
+            # Read header to understand what this shard contains.
             magic = struct.unpack('<I', f.read(4))[0]
             if magic != GGUF_MAGIC:
                 raise ValueError(f"Invalid GGUF magic in {part_path}: {hex(magic)}")
             
-            _version = struct.unpack('<I', f.read(4))[0]
+            version = struct.unpack('<I', f.read(4))[0]
             tensor_count = struct.unpack('<Q', f.read(8))[0]
             metadata_kv_count = struct.unpack('<Q', f.read(8))[0]
+            print(f"[vram-llm] {part_path.name}: version={version} tensors={tensor_count} metadata_kv={metadata_kv_count}")
+            logger.info(
+                "Part %s: version=%s tensor_count=%s metadata_kv=%s",
+                part_path.name,
+                version,
+                tensor_count,
+                metadata_kv_count,
+            )
             
             # Read metadata to find n_layers
             for _ in range(metadata_kv_count):
@@ -318,7 +348,8 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
                 tensor_type = struct.unpack('<I', f.read(4))[0]
                 _offset = struct.unpack('<Q', f.read(8))[0]
                 
-                # Calculate tensor size
+                # Calculate tensor size in bytes; for quantized tensors we approximate
+                # using per-block sizes. This is what we later aggregate to per-layer MB/GB.
                 n_elements = 1
                 for d in dims:
                     n_elements *= d
@@ -352,6 +383,16 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
                             layer_idx = int(p)
                             break
                 
+                # Log tensor-level details to the layer log for inspection
+                size_mb = size_bytes / (1024 * 1024)
+                logger.info(
+                    "Tensor %s | layer=%s | type=%s | dims=%s | size=%.2f MB",
+                    name,
+                    layer_idx if layer_idx is not None else "-",
+                    tensor_type,
+                    dims,
+                    size_mb,
+                )
                 tensors.append(TensorInfo(name=name, size_bytes=size_bytes, layer_index=layer_idx))
     
     # Derive n_layers from metadata or fallback to max layer index seen
