@@ -321,11 +321,9 @@ def calculate_layers_per_gpu(
     
     current_gpu = 0
     
-    for layer_idx, layer_size in enumerate(layer_sizes):
-        # Find a GPU with enough budget
-        assigned = False
-        for attempt in range(n_gpus):
-            gpu = (current_gpu + attempt) % n_gpus
+    # change the algorithm to assign layers to GPU first iterating over GPU list then layer list    
+    for gpu in range(n_gpus):
+        for layer_idx, layer_size in enumerate(layer_sizes):
             if remaining_budget[gpu] >= layer_size:
                 layers_per_gpu[gpu] += 1
                 remaining_budget[gpu] -= layer_size
@@ -340,7 +338,7 @@ def calculate_layers_per_gpu(
             remaining_budget[gpu] -= layer_size
             
     return layers_per_gpu
-                    
+
 def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     """
     Analyze a GGUF model file to determine layer sizes.
