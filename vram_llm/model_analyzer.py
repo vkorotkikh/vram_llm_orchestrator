@@ -291,7 +291,61 @@ def _list_torch_gpus(devices: Optional[list[int]] = None) -> list[TorchGPUStats]
         )
     return gpus
 
+def calculate_layers_per_gpu(model_path: str, gpu_budgets_mib: list[int]) -> tuple[list[float], list[int]]:
+    """
+    Calculate optimal layer distribution across GPUs.
+    """
+    path = Path(model_path).expanduser().resolve()
+    paths = _resolve_multipart_paths(path)
+    logger = _layer_logger()
+    log_path = getattr(logger.handlers[0], "baseFilename", "layer_sizes.log") if logger.handlers else "layer_sizes.log"
+    logger.info("Analyzing GGUF parts: %s", ", ".join(p.name for p in paths))
+    print(f"[vram-llm] analyzing {len(paths)} GGUF part(s); detailed log -> {log_path}")
+    
+    # Collect tensor information
+    tensors: list[TensorInfo] = []
+    n_layers_meta = 0
+    
+    for part_path in paths:
+        with open(part_path, 'rb') as f:
+            # Read header to understand what this shard contains.
+            magic = struct.unpack('<I', f.read(4))[0]
+            if magic != GGUF_MAGIC:
+                raise ValueError(f"Invalid GGUF magic in {part_path}: {hex(magic)}")
+            
+            version = struct.unpack('<I', f.read(4))[0]
+            tensor_count = struct.unpack('<Q', f.read(8))[0]
+            metadata_kv_count = struct.unpack('<Q', f.read(8))[0]
 
+            # Read metadata to find n_layers
+            for _ in range(metadata_kv_count):
+                key = _read_string(f)
+                value_type = struct.unpack('<I', f.read(4))[0]
+                
+                if key.endswith('.block_count') or key.endswith('.n_layer'):
+                    val = _read_metadata_uint32(f, value_type)
+                    if val is not None:
+                        n_layers_meta = max(n_layers_meta, val)
+                else:
+                    _skip_metadata_value(f, value_type)
+            
+            # Read tensor info
+            for _ in range(tensor_count):
+                name = _read_string(f)
+                n_dims = struct.unpack('<I', f.read(4))[0]
+                dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
+                tensor_type = struct.unpack('<I', f.read(4))[0]
+                _offset = struct.unpack('<Q', f.read(8))[0]
+                
+                # Calculate tensor size in bytes; for quantized tensors we approximate
+                # using per-block sizes. This is what we later aggregate to per-layer MB/GB.
+                n_elements = 1
+                for d in dims:
+                    n_elements *= d
+                
+                # Get bytes per element (approximate for quantized types)
+                bytes_per_elem = GGUF_TENSOR_TYPE_SIZES.get(tensor_type, 1)
+                
 def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     """
     Analyze a GGUF model file to determine layer sizes.
@@ -421,10 +475,13 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
         logger.info("Layer %d total: %.2f MB (%d tensors)", idx, size_mb, layer_counts[idx])
     logger.info("Embeddings total: %.2f MB", embedding_size / (1024 * 1024))
     logger.info("Output head total: %.2f MB", output_size / (1024 * 1024))
-    
+
+    # Calculate total size and average layer size
     total_size = sum(t.size_bytes for t in tensors)
     avg_layer_size = sum(layer_sizes) // len(layer_sizes) if layer_sizes else 0
     
+    print(f"[vram-llm] total size: {total_size / (1024**3):.2f} GB")
+
     return ModelAnalysis(
         model_path=str(path),
         total_size_bytes=total_size,
