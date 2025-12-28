@@ -291,61 +291,56 @@ def _list_torch_gpus(devices: Optional[list[int]] = None) -> list[TorchGPUStats]
         )
     return gpus
 
-def calculate_layers_per_gpu(model_path: str, gpu_budgets_mib: list[int]) -> tuple[list[float], list[int]]:
+def calculate_layers_per_gpu(
+    model_path: str,
+    gpu_budgets_mib: list[int],
+    layer_sizes: list[int],
+) -> tuple[list[float], list[int]]:
     """
     Calculate optimal layer distribution across GPUs.
     """
-    path = Path(model_path).expanduser().resolve()
-    paths = _resolve_multipart_paths(path)
-    logger = _layer_logger()
-    log_path = getattr(logger.handlers[0], "baseFilename", "layer_sizes.log") if logger.handlers else "layer_sizes.log"
-    logger.info("Analyzing GGUF parts: %s", ", ".join(p.name for p in paths))
-    print(f"[vram-llm] analyzing {len(paths)} GGUF part(s); detailed log -> {log_path}")
+    n_gpus = len(gpu_budgets_mib)
+    if n_gpus == 0:
+        return [], []
     
-    # Collect tensor information
-    tensors: list[TensorInfo] = []
-    n_layers_meta = 0
+    # Convert budgets to bytes, accounting for reserve
+    budgets_bytes = [(b - reserve_mib) * 1024 * 1024 for b in gpu_budgets_mib]
     
-    for part_path in paths:
-        with open(part_path, 'rb') as f:
-            # Read header to understand what this shard contains.
-            magic = struct.unpack('<I', f.read(4))[0]
-            if magic != GGUF_MAGIC:
-                raise ValueError(f"Invalid GGUF magic in {part_path}: {hex(magic)}")
+    # identify the largest gpu by vram size and make it gpu 0
+    largest_gpu = max(gpu_budgets_mib, key=lambda x: x)
+    gpu_budgets_mib[0] = largest_gpu
+    gpu_budgets_mib.remove(largest_gpu) 
+    
+    # GPU 0 also holds embeddings and output layer, reduce its budget
+    overhead_gpu0 = embedding_size + output_size
+    budgets_bytes[0] = max(0, budgets_bytes[0] - overhead_gpu0)
+    
+    # Greedily assign layers to GPUs
+    layers_per_gpu = [0] * n_gpus
+    remaining_budget = list(budgets_bytes)
+    
+    current_gpu = 0
+    
+    for layer_idx, layer_size in enumerate(layer_sizes):
+        # Find a GPU with enough budget
+        assigned = False
+        for attempt in range(n_gpus):
+            gpu = (current_gpu + attempt) % n_gpus
+            if remaining_budget[gpu] >= layer_size:
+                layers_per_gpu[gpu] += 1
+                remaining_budget[gpu] -= layer_size
+                current_gpu = gpu
+                assigned = True
+                break
+                
+        if not assigned:
+            # No GPU has enough space - assign to GPU with most remaining
+            gpu = remaining_budget.index(max(remaining_budget))
+            layers_per_gpu[gpu] += 1
+            remaining_budget[gpu] -= layer_size
             
-            version = struct.unpack('<I', f.read(4))[0]
-            tensor_count = struct.unpack('<Q', f.read(8))[0]
-            metadata_kv_count = struct.unpack('<Q', f.read(8))[0]
-
-            # Read metadata to find n_layers
-            for _ in range(metadata_kv_count):
-                key = _read_string(f)
-                value_type = struct.unpack('<I', f.read(4))[0]
-                
-                if key.endswith('.block_count') or key.endswith('.n_layer'):
-                    val = _read_metadata_uint32(f, value_type)
-                    if val is not None:
-                        n_layers_meta = max(n_layers_meta, val)
-                else:
-                    _skip_metadata_value(f, value_type)
-            
-            # Read tensor info
-            for _ in range(tensor_count):
-                name = _read_string(f)
-                n_dims = struct.unpack('<I', f.read(4))[0]
-                dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
-                tensor_type = struct.unpack('<I', f.read(4))[0]
-                _offset = struct.unpack('<Q', f.read(8))[0]
-                
-                # Calculate tensor size in bytes; for quantized tensors we approximate
-                # using per-block sizes. This is what we later aggregate to per-layer MB/GB.
-                n_elements = 1
-                for d in dims:
-                    n_elements *= d
-                
-                # Get bytes per element (approximate for quantized types)
-                bytes_per_elem = GGUF_TENSOR_TYPE_SIZES.get(tensor_type, 1)
-                
+    return layers_per_gpu
+                    
 def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     """
     Analyze a GGUF model file to determine layer sizes.
