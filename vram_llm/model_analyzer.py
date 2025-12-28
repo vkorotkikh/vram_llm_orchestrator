@@ -8,12 +8,12 @@ Reads GGUF metadata to determine:
 """
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import os
-from typing import Optional
 
 
 # GGUF format constants
@@ -204,6 +204,33 @@ def _bytes_to_mib(v: int) -> int:
     return int(v // (1024 * 1024))
 
 
+def _resolve_multipart_paths(path: Path) -> list[Path]:
+    """
+    If the model is split (e.g., foo-00001-of-00002.gguf), return all parts.
+    Otherwise return [path].
+    """
+    if not path.name.lower().endswith(".gguf"):
+        raise ValueError(f"Expected a GGUF file, got: {path}")
+
+    m = re.match(r"(.+)-(\d+)-of-(\d+)\.gguf$", path.name, re.IGNORECASE)
+    if not m:
+        if not path.exists():
+            raise FileNotFoundError(f"Model file not found: {path}")
+        return [path]
+
+    prefix, idx_str, total_str = m.group(1), m.group(2), m.group(3)
+    total_parts = int(total_str)
+    width = len(idx_str)
+
+    parts: list[Path] = []
+    for i in range(1, total_parts + 1):
+        candidate = path.with_name(f"{prefix}-{i:0{width}d}-of-{total_str}.gguf")
+        if not candidate.exists():
+            raise FileNotFoundError(f"Missing GGUF part {i} of {total_parts}: {candidate}")
+        parts.append(candidate)
+    return parts
+
+
 def _list_torch_gpus(devices: Optional[list[int]] = None) -> list[TorchGPUStats]:
     """List GPUs using torch.cuda (per-process free memory)."""
     try:
@@ -251,84 +278,87 @@ def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     """
     Analyze a GGUF model file to determine layer sizes.
     
-    For split models (part 1 of N), this analyzes the first file.
+    For split models (part N of M), this analyzes all parts and aggregates tensors.
     """
     path = Path(model_path).expanduser().resolve()
-    
-    if not path.exists():
-        raise FileNotFoundError(f"Model file not found: {path}")
+    paths = _resolve_multipart_paths(path)
     
     # Collect tensor information
     tensors: list[TensorInfo] = []
-    n_layers = 0
+    n_layers_meta = 0
     
-    with open(path, 'rb') as f:
-        # Read header
-        magic = struct.unpack('<I', f.read(4))[0]
-        if magic != GGUF_MAGIC:
-            raise ValueError(f"Invalid GGUF magic: {hex(magic)}")
-        
-        version = struct.unpack('<I', f.read(4))[0]
-        tensor_count = struct.unpack('<Q', f.read(8))[0]
-        metadata_kv_count = struct.unpack('<Q', f.read(8))[0]
-        
-        # Read metadata to find n_layers
-        for _ in range(metadata_kv_count):
-            key = _read_string(f)
-            value_type = struct.unpack('<I', f.read(4))[0]
+    for part_path in paths:
+        with open(part_path, 'rb') as f:
+            # Read header
+            magic = struct.unpack('<I', f.read(4))[0]
+            if magic != GGUF_MAGIC:
+                raise ValueError(f"Invalid GGUF magic in {part_path}: {hex(magic)}")
             
-            if key.endswith('.block_count') or key.endswith('.n_layer'):
-                val = _read_metadata_uint32(f, value_type)
-                if val is not None:
-                    n_layers = max(n_layers, val)
-            else:
-                _skip_metadata_value(f, value_type)
-        
-        # Read tensor info
-        for _ in range(tensor_count):
-            name = _read_string(f)
-            n_dims = struct.unpack('<I', f.read(4))[0]
-            dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
-            tensor_type = struct.unpack('<I', f.read(4))[0]
-            offset = struct.unpack('<Q', f.read(8))[0]
+            _version = struct.unpack('<I', f.read(4))[0]
+            tensor_count = struct.unpack('<Q', f.read(8))[0]
+            metadata_kv_count = struct.unpack('<Q', f.read(8))[0]
             
-            # Calculate tensor size
-            n_elements = 1
-            for d in dims:
-                n_elements *= d
+            # Read metadata to find n_layers
+            for _ in range(metadata_kv_count):
+                key = _read_string(f)
+                value_type = struct.unpack('<I', f.read(4))[0]
+                
+                if key.endswith('.block_count') or key.endswith('.n_layer'):
+                    val = _read_metadata_uint32(f, value_type)
+                    if val is not None:
+                        n_layers_meta = max(n_layers_meta, val)
+                else:
+                    _skip_metadata_value(f, value_type)
             
-            # Get bytes per element (approximate for quantized types)
-            bytes_per_elem = GGUF_TENSOR_TYPE_SIZES.get(tensor_type, 1)
-            
-            # For quantized types, adjust for block size
-            if tensor_type in [2, 3]:  # Q4_0, Q4_1
-                size_bytes = (n_elements // 32) * 18  # 32 elements per block
-            elif tensor_type in [6, 7]:  # Q5_0, Q5_1
-                size_bytes = (n_elements // 32) * 22
-            elif tensor_type in [8, 9]:  # Q8_0, Q8_1
-                size_bytes = (n_elements // 32) * 34
-            else:
-                size_bytes = n_elements * bytes_per_elem
-            
-            # Determine layer index from name
-            layer_idx = None
-            if '.layers.' in name or 'blk.' in name:
-                # Extract layer number from name like "blk.0.attn" or "model.layers.0.self_attn"
-                parts = name.replace('.layers.', '.blk.').split('.')
-                for i, p in enumerate(parts):
-                    if p == 'blk' and i + 1 < len(parts):
-                        try:
-                            layer_idx = int(parts[i + 1])
-                        except ValueError:
-                            pass
-                        break
-                    elif p.isdigit():
-                        layer_idx = int(p)
-                        break
-            
-            tensors.append(TensorInfo(name=name, size_bytes=size_bytes, layer_index=layer_idx))
+            # Read tensor info
+            for _ in range(tensor_count):
+                name = _read_string(f)
+                n_dims = struct.unpack('<I', f.read(4))[0]
+                dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
+                tensor_type = struct.unpack('<I', f.read(4))[0]
+                _offset = struct.unpack('<Q', f.read(8))[0]
+                
+                # Calculate tensor size
+                n_elements = 1
+                for d in dims:
+                    n_elements *= d
+                
+                # Get bytes per element (approximate for quantized types)
+                bytes_per_elem = GGUF_TENSOR_TYPE_SIZES.get(tensor_type, 1)
+                
+                # For quantized types, adjust for block size
+                if tensor_type in [2, 3]:  # Q4_0, Q4_1
+                    size_bytes = (n_elements // 32) * 18  # 32 elements per block
+                elif tensor_type in [6, 7]:  # Q5_0, Q5_1
+                    size_bytes = (n_elements // 32) * 22
+                elif tensor_type in [8, 9]:  # Q8_0, Q8_1
+                    size_bytes = (n_elements // 32) * 34
+                else:
+                    size_bytes = n_elements * bytes_per_elem
+                
+                # Determine layer index from name
+                layer_idx = None
+                if '.layers.' in name or 'blk.' in name:
+                    # Extract layer number from name like "blk.0.attn" or "model.layers.0.self_attn"
+                    parts = name.replace('.layers.', '.blk.').split('.')
+                    for i, p in enumerate(parts):
+                        if p == 'blk' and i + 1 < len(parts):
+                            try:
+                                layer_idx = int(parts[i + 1])
+                            except ValueError:
+                                pass
+                            break
+                        elif p.isdigit():
+                            layer_idx = int(p)
+                            break
+                
+                tensors.append(TensorInfo(name=name, size_bytes=size_bytes, layer_index=layer_idx))
     
-    # Aggregate by layer
+    # Derive n_layers from metadata or fallback to max layer index seen
+    max_layer_seen = max((t.layer_index for t in tensors if t.layer_index is not None), default=-1)
+    n_layers = max(n_layers_meta, max_layer_seen + 1)
+    
+    # Aggregate by layer after we know layer count
     layer_sizes = [0] * n_layers if n_layers > 0 else []
     embedding_size = 0
     output_size = 0
