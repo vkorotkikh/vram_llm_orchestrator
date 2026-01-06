@@ -146,11 +146,19 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 def cmd_analyze(args: argparse.Namespace) -> int:
     """Analyze a GGUF model and show recommended GPU allocation."""
-    from .model_analyzer import analyze_gguf_model, print_model_analysis
+    from .model_analyzer import (
+        analyze_gguf_model,
+        print_model_analysis,
+        get_gpus_sorted_by_vram,
+        allocate_layers_sequential,
+        print_allocation_plan,
+        TorchGPUStats,
+    )
     
-    gpus = list_gpus()
-    print("[vram-llm] detected GPUs:")
-    print(gpus_markdown_table(gpus))
+    # Get GPUs via NVML (always available)
+    nvml_gpus = list_gpus()
+    print("[vram-llm] detected GPUs (NVML):")
+    print(gpus_markdown_table(nvml_gpus))
     
     print(f"\n[vram-llm] Analyzing model: {args.model_path}")
     
@@ -158,39 +166,62 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         analysis = analyze_gguf_model(args.model_path)
         print_model_analysis(analysis)
         
-        if gpus:
-            # Calculate recommended distribution based on actual layer sizes
-            gpu_budgets = [g.free_mib for g in gpus]
-            tensor_split, layers_per_gpu = analysis.get_layer_distribution(
-                gpu_budgets, 
-                reserve_mib=args.reserve_mib
+        # Try PyTorch GPU detection first, fall back to NVML
+        sorted_gpus = get_gpus_sorted_by_vram(by_free=True)
+        
+        if not sorted_gpus and nvml_gpus:
+            # Fallback: Convert NVML GPUs to TorchGPUStats format and sort by free VRAM
+            print("\n[vram-llm] PyTorch not available, using NVML GPU info...")
+            nvml_sorted = sorted(nvml_gpus, key=lambda g: g.free_mib, reverse=True)
+            sorted_gpus = [
+                TorchGPUStats(
+                    index=g.index,
+                    name=g.name,
+                    total_mib=g.total_mib,
+                    free_mib=g.free_mib,
+                    used_mib=g.used_mib,
+                    reordered_index=i,
+                )
+                for i, g in enumerate(nvml_sorted)
+            ]
+        
+        if sorted_gpus:
+            print(f"\n[vram-llm] GPUs sorted by free VRAM (GPU0 = highest):")
+            for g in sorted_gpus:
+                print(f"  GPU {g.reordered_index} (CUDA:{g.index}): {g.name} - "
+                      f"{g.free_mib:,} / {g.total_mib:,} MiB")
+            
+            # Calculate layer allocation using sorted GPU budgets
+            gpu_budgets = [g.free_mib for g in sorted_gpus]
+            plan = allocate_layers_sequential(
+                analysis,
+                gpu_budgets,
+                reserve_mib=args.reserve_mib,
+                gpus=sorted_gpus,
             )
             
-            print(f"\n[vram-llm] Recommended allocation for your GPUs:")
-            print(f"  GPU budgets (free MiB): {gpu_budgets}")
-            print(f"  Reserve per GPU: {args.reserve_mib} MiB")
-            print(f"  Layers per GPU: {layers_per_gpu}")
-            print(f"  tensor_split: {[round(t, 3) for t in tensor_split]}")
-            
-            # Format as CLI argument
-            ts_str = ",".join(f"{t:.3f}" for t in tensor_split)
-            print(f"\n  Use with: --tensor-split \"{ts_str}\"")
+            # Print detailed allocation plan
+            print_allocation_plan(plan, analysis)
             
             # Check if model fits
             total_model_gb = analysis.total_size_bytes / (1024**3)
             total_vram_gb = sum(gpu_budgets) / 1024
-            usable_vram_gb = (sum(gpu_budgets) - args.reserve_mib * len(gpus)) / 1024
+            usable_vram_gb = (sum(gpu_budgets) - args.reserve_mib * len(sorted_gpus)) / 1024
             
-            print(f"\n  Model size: {total_model_gb:.1f} GB")
+            print(f"  Model size: {total_model_gb:.1f} GB")
             print(f"  Total VRAM: {total_vram_gb:.1f} GB")
             print(f"  Usable VRAM (after reserve): {usable_vram_gb:.1f} GB")
             
             if total_model_gb > usable_vram_gb * 0.95:
                 print(f"\n  ⚠️  WARNING: Model is close to or exceeds usable VRAM!")
                 print(f"     Consider: smaller quantization, fewer layers (--n-gpu-layers), or smaller context (--n-ctx)")
+        else:
+            print("\n[vram-llm] No GPUs detected. Cannot compute allocation.")
         
     except Exception as e:
+        import traceback
         print(f"[vram-llm] ERROR: Failed to analyze model: {e}")
+        traceback.print_exc()
         return 1
     
     return 0
@@ -240,29 +271,71 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # Use smart allocation based on actual model layer sizes
     elif args.smart_split:
         try:
-            from .model_analyzer import analyze_gguf_model, print_model_analysis
+            from .model_analyzer import (
+                analyze_gguf_model,
+                print_model_analysis,
+                get_gpus_sorted_by_vram,
+                allocate_layers_sequential,
+                print_allocation_plan,
+                TorchGPUStats,
+            )
             
-            print(f"\n[vram-llm] Analyzing model for smart allocation...")
+            print(f"\n[vram-llm] Analyzing model for smart layer-aware allocation...")
             analysis = analyze_gguf_model(args.model_path)
             print_model_analysis(analysis)
             
-            # Get GPU budgets in the reordered CUDA_VISIBLE_DEVICES order
-            g_map = {g.index: g for g in gpus}
-            gpu_budgets = [g_map[idx].free_mib for idx in plan.cuda_visible_devices]
+            # Get GPUs sorted by VRAM (highest first) - try PyTorch first, fallback to NVML
+            sorted_gpus = get_gpus_sorted_by_vram(by_free=True)
             
-            tensor_split, layers_per_gpu = analysis.get_layer_distribution(
-                gpu_budgets,
-                reserve_mib=args.reserve_mib,
-            )
+            if not sorted_gpus and gpus:
+                # Fallback: Convert NVML GPUs to TorchGPUStats format
+                print("[vram-llm] PyTorch not available, using NVML GPU info...")
+                nvml_sorted = sorted(gpus, key=lambda g: g.free_mib, reverse=True)
+                sorted_gpus = [
+                    TorchGPUStats(
+                        index=g.index,
+                        name=g.name,
+                        total_mib=g.total_mib,
+                        free_mib=g.free_mib,
+                        used_mib=g.used_mib,
+                        reordered_index=i,
+                    )
+                    for i, g in enumerate(nvml_sorted)
+                ]
             
-            print(f"\n[vram-llm] Smart allocation result:")
-            print(f"  Layers per GPU: {layers_per_gpu}")
-            print(f"  tensor_split: {[round(t, 3) for t in tensor_split]}")
-            
-            plan_for_model = replace(plan_for_model, tensor_split=tensor_split)
+            if sorted_gpus:
+                # Use sorted GPU budgets for allocation
+                gpu_budgets = [g.free_mib for g in sorted_gpus]
+                
+                allocation_plan = allocate_layers_sequential(
+                    analysis,
+                    gpu_budgets,
+                    reserve_mib=args.reserve_mib,
+                    gpus=sorted_gpus,
+                )
+                
+                print_allocation_plan(allocation_plan, analysis)
+                
+                # Update the plan with computed tensor_split
+                plan_for_model = replace(plan_for_model, tensor_split=allocation_plan.tensor_split)
+                
+                # Also update CUDA_VISIBLE_DEVICES to match the sorted order
+                sorted_cuda_devices = [g.index for g in sorted_gpus]
+                if sorted_cuda_devices != plan.cuda_visible_devices:
+                    print(f"[vram-llm] Reordering GPUs by VRAM: {sorted_cuda_devices}")
+                    plan_for_model = replace(plan_for_model, cuda_visible_devices=sorted_cuda_devices)
+                    # Re-apply CUDA_VISIBLE_DEVICES with new order
+                    if not args.no_set_cuda_visible_devices:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in sorted_cuda_devices)
+                        print(f"[vram-llm] Updated CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+            else:
+                print("[vram-llm] WARNING: No GPUs detected for smart split.")
+                print("[vram-llm] Falling back to VRAM-based heuristic.")
             
         except Exception as e:
+            import traceback
             print(f"\n[vram-llm] WARNING: Smart split failed: {e}")
+            traceback.print_exc()
             print("[vram-llm] Falling back to VRAM-based heuristic.")
 
     if args.use_fit_params:
@@ -298,6 +371,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not use_mmap:
         print("[vram-llm] mmap disabled - loading directly to GPU (lower RAM usage)")
     
+    # Skip tensor_split adjustment if using smart-split (already accounts for layer sizes)
+    skip_adjustment = args.smart_split or (args.tensor_split is not None)
+    
     engine.load(
         model_path=args.model_path,
         plan=plan_for_model,
@@ -309,6 +385,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         use_mlock=args.mlock,
         chat_format=args.chat_format,
         verbose=True,
+        skip_tensor_split_adjustment=skip_adjustment,
     )
 
     app = create_app(engine=engine, plan=plan_for_model, gpus=gpus)
