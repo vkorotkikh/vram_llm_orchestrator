@@ -84,74 +84,52 @@ class ModelAnalysis:
     ) -> tuple[list[float], list[int]]:
         """
         Calculate optimal layer distribution across GPUs.
-
-        GPUs are first ordered by available budget (largest first) so GPU 0 is the
-        biggest. We then fill each GPU sequentially: pack as many layers as fit on
-        GPU 0, move to GPU 1 when it cannot fit the next layer, and so on. If the
-        total model (layers + embeddings + output) cannot fit after reserve, a
-        best-effort placement is still returned.
-
+        
         Returns:
-            tensor_split: Normalized proportions for each GPU (in the sorted order)
-            layers_per_gpu: Number of layers assigned to each GPU (same order)
+            tensor_split: Normalized proportions for each GPU
+            layers_per_gpu: Number of layers assigned to each GPU
         """
-        logger = logging.getLogger(__name__)
         n_gpus = len(gpu_budgets_mib)
         if n_gpus == 0:
             return [], []
-
-        # Convert budgets to bytes, accounting for reserve, and clamp at 0
-        budgets_bytes = [max(0, (b - reserve_mib) * 1024 * 1024) for b in gpu_budgets_mib]
-
-        # Quick feasibility check using total capacity after reserve
-        total_required = sum(self.layer_sizes) + self.embedding_size + self.output_size
-        total_available = sum(budgets_bytes)
-        if total_required > total_available:
-            logger.warning(
-                "Model requires %.2f GiB (layers + embeddings/output) but only %.2f GiB "
-                "VRAM available after reserve; allocation will oversubscribe.",
-                total_required / (1024**3),
-                total_available / (1024**3),
-            )
-
-        # Order GPUs by available budget so GPU 0 is the largest
-        order = sorted(range(n_gpus), key=lambda i: budgets_bytes[i], reverse=True)
-        budgets_bytes = [budgets_bytes[i] for i in order]
-
+        
+        # Convert budgets to bytes, accounting for reserve
+        budgets_bytes = [(b - reserve_mib) * 1024 * 1024 for b in gpu_budgets_mib]
+        
         # GPU 0 also holds embeddings and output layer, reduce its budget
         overhead_gpu0 = self.embedding_size + self.output_size
         budgets_bytes[0] = max(0, budgets_bytes[0] - overhead_gpu0)
-
+        
+        # Greedily assign layers to GPUs
         layers_per_gpu = [0] * n_gpus
         remaining_budget = list(budgets_bytes)
-
-        # Sequentially pack layers: fill GPU 0, then GPU 1, etc.
+        
         current_gpu = 0
-        for layer_size in self.layer_sizes:
-            placed = False
-
-            while current_gpu < n_gpus:
-                if remaining_budget[current_gpu] >= layer_size:
-                    layers_per_gpu[current_gpu] += 1
-                    remaining_budget[current_gpu] -= layer_size
-                    placed = True
+        for layer_idx, layer_size in enumerate(self.layer_sizes):
+            # Find a GPU with enough budget
+            assigned = False
+            for attempt in range(n_gpus):
+                gpu = (current_gpu + attempt) % n_gpus
+                if remaining_budget[gpu] >= layer_size:
+                    layers_per_gpu[gpu] += 1
+                    remaining_budget[gpu] -= layer_size
+                    current_gpu = gpu
+                    assigned = True
                     break
-                current_gpu += 1
-
-            if not placed:
-                # Best-effort fallback: pick the GPU with the most remaining space
-                fallback_gpu = remaining_budget.index(max(remaining_budget))
-                layers_per_gpu[fallback_gpu] += 1
-                remaining_budget[fallback_gpu] -= layer_size
-                current_gpu = fallback_gpu
-
+            
+            if not assigned:
+                # No GPU has enough space - assign to GPU with most remaining
+                gpu = remaining_budget.index(max(remaining_budget))
+                layers_per_gpu[gpu] += 1
+                remaining_budget[gpu] -= layer_size
+        
         # Calculate tensor_split proportions based on actual assigned layers
         total_layers = sum(layers_per_gpu)
         if total_layers == 0:
             return [1.0 / n_gpus] * n_gpus, [0] * n_gpus
-
+        
         tensor_split = [l / total_layers for l in layers_per_gpu]
-
+        
         return tensor_split, layers_per_gpu
 
     def get_torch_based_distribution(
@@ -313,53 +291,202 @@ def _list_torch_gpus(devices: Optional[list[int]] = None) -> list[TorchGPUStats]
         )
     return gpus
 
-def calculate_layers_per_gpu(
-    model_path: str,
-    gpu_budgets_mib: list[int],
-    layer_sizes: list[int],
-) -> tuple[list[float], list[int]]:
+@dataclass
+class LayerAllocation:
+    """Represents a layer's VRAM size and its assignment."""
+    layer_index: int
+    size_bytes: int
+    size_mib: float
+    assigned_gpu: Optional[int] = None
+
+
+@dataclass 
+class GPUAllocationPlan:
+    """Complete allocation plan showing which layers go to which GPU."""
+    layer_allocations: list[LayerAllocation]
+    layers_per_gpu: list[list[int]]  # layers_per_gpu[gpu_idx] = [layer_indices...]
+    vram_per_gpu_mib: list[float]    # Total VRAM used per GPU
+    tensor_split: list[float]        # Normalized proportions for llama.cpp
+    gpu_budgets_mib: list[int]       # Original budgets
+    embedding_gpu: int               # Which GPU holds embeddings (usually 0)
+    output_gpu: int                  # Which GPU holds output layer (usually last)
+
+
+def create_layer_size_list(analysis: 'ModelAnalysis') -> list[LayerAllocation]:
     """
-    Calculate optimal layer distribution across GPUs.
+    Create a list of LayerAllocation objects with VRAM sizes for each layer.
+    
+    Returns:
+        List of LayerAllocation objects sorted by layer index
+    """
+    allocations = []
+    for layer_idx, size_bytes in enumerate(analysis.layer_sizes):
+        allocations.append(LayerAllocation(
+            layer_index=layer_idx,
+            size_bytes=size_bytes,
+            size_mib=size_bytes / (1024 * 1024),
+            assigned_gpu=None,
+        ))
+    return allocations
+
+
+def allocate_layers_sequential(
+    analysis: 'ModelAnalysis',
+    gpu_budgets_mib: list[int],
+    reserve_mib: int = 512,
+) -> GPUAllocationPlan:
+    """
+    Allocate layers to GPUs sequentially: fill GPU0 first, then GPU1, then GPU2, etc.
+    
+    This approach assigns layers in order (0, 1, 2, ...) to GPUs, moving to the next
+    GPU only when the current one is full.
+    
+    Args:
+        analysis: Model analysis with layer sizes
+        gpu_budgets_mib: Available VRAM per GPU in MiB
+        reserve_mib: VRAM to reserve per GPU for KV cache, compute buffers, etc.
+    
+    Returns:
+        GPUAllocationPlan with complete allocation details
     """
     n_gpus = len(gpu_budgets_mib)
     if n_gpus == 0:
-        return [], []
+        raise ValueError("No GPUs provided")
     
-    # Convert budgets to bytes, accounting for reserve
-    budgets_bytes = [(b - reserve_mib) * 1024 * 1024 for b in gpu_budgets_mib]
+    # Create layer allocation list
+    layer_allocations = create_layer_size_list(analysis)
     
-    # identify the largest gpu by vram size and make it gpu 0
-    largest_gpu = max(gpu_budgets_mib, key=lambda x: x)
-    gpu_budgets_mib[0] = largest_gpu
-    gpu_budgets_mib.remove(largest_gpu) 
+    # Calculate effective budgets (subtract reserve)
+    effective_budgets = [max(0, b - reserve_mib) for b in gpu_budgets_mib]
     
-    # GPU 0 also holds embeddings and output layer, reduce its budget
-    overhead_gpu0 = embedding_size + output_size
-    budgets_bytes[0] = max(0, budgets_bytes[0] - overhead_gpu0)
+    # GPU 0 also holds embeddings, reduce its budget
+    embedding_mib = analysis.embedding_size / (1024 * 1024)
+    effective_budgets[0] = max(0, effective_budgets[0] - embedding_mib)
     
-    # Greedily assign layers to GPUs
-    layers_per_gpu = [0] * n_gpus
-    remaining_budget = list(budgets_bytes)
+    # Last GPU holds output layer, reduce its budget
+    output_mib = analysis.output_size / (1024 * 1024)
+    effective_budgets[-1] = max(0, effective_budgets[-1] - output_mib)
     
+    # Track remaining budget per GPU
+    remaining_budget = list(effective_budgets)
+    
+    # Track which layers go to which GPU
+    layers_per_gpu: list[list[int]] = [[] for _ in range(n_gpus)]
+    vram_per_gpu: list[float] = [0.0] * n_gpus
+    
+    # Sequential allocation: fill GPU0, then GPU1, then GPU2...
     current_gpu = 0
     
-    # change the algorithm to assign layers to GPU first iterating over GPU list then layer list    
-    for gpu in range(n_gpus):
-        for layer_idx, layer_size in enumerate(layer_sizes):
-            if remaining_budget[gpu] >= layer_size:
-                layers_per_gpu[gpu] += 1
-                remaining_budget[gpu] -= layer_size
-                current_gpu = gpu
-                assigned = True
-                break
-                
-        if not assigned:
-            # No GPU has enough space - assign to GPU with most remaining
-            gpu = remaining_budget.index(max(remaining_budget))
-            layers_per_gpu[gpu] += 1
-            remaining_budget[gpu] -= layer_size
+    for alloc in layer_allocations:
+        layer_size_mib = alloc.size_mib
+        
+        # Find a GPU with enough budget, starting from current_gpu
+        assigned = False
+        for gpu_offset in range(n_gpus):
+            gpu_idx = (current_gpu + gpu_offset) % n_gpus
             
-    return layers_per_gpu
+            if remaining_budget[gpu_idx] >= layer_size_mib:
+                # Assign to this GPU
+                alloc.assigned_gpu = gpu_idx
+                layers_per_gpu[gpu_idx].append(alloc.layer_index)
+                vram_per_gpu[gpu_idx] += layer_size_mib
+                remaining_budget[gpu_idx] -= layer_size_mib
+                assigned = True
+                
+                # Stay on current GPU until it's full (sequential fill)
+                if gpu_offset > 0:
+                    # We had to move to a different GPU, update current
+                    current_gpu = gpu_idx
+                break
+        
+        if not assigned:
+            # No GPU has enough space - force assign to GPU with most remaining
+            gpu_idx = remaining_budget.index(max(remaining_budget))
+            alloc.assigned_gpu = gpu_idx
+            layers_per_gpu[gpu_idx].append(alloc.layer_index)
+            vram_per_gpu[gpu_idx] += layer_size_mib
+            remaining_budget[gpu_idx] -= layer_size_mib
+            print(f"[WARNING] Layer {alloc.layer_index} ({layer_size_mib:.1f} MiB) force-assigned to GPU {gpu_idx}")
+    
+    # Calculate tensor_split proportions
+    total_layers = len(layer_allocations)
+    if total_layers > 0:
+        tensor_split = [len(layers) / total_layers for layers in layers_per_gpu]
+    else:
+        tensor_split = [1.0 / n_gpus] * n_gpus
+    
+    # Add embedding overhead to GPU 0's VRAM usage for reporting
+    vram_per_gpu[0] += embedding_mib
+    # Add output overhead to last GPU's VRAM usage for reporting
+    vram_per_gpu[-1] += output_mib
+    
+    return GPUAllocationPlan(
+        layer_allocations=layer_allocations,
+        layers_per_gpu=layers_per_gpu,
+        vram_per_gpu_mib=vram_per_gpu,
+        tensor_split=tensor_split,
+        gpu_budgets_mib=gpu_budgets_mib,
+        embedding_gpu=0,
+        output_gpu=n_gpus - 1,
+    )
+
+
+def print_allocation_plan(plan: GPUAllocationPlan, analysis: 'ModelAnalysis') -> None:
+    """Print a detailed allocation plan."""
+    print(f"\n{'='*60}")
+    print("LAYER-TO-GPU ALLOCATION PLAN")
+    print(f"{'='*60}")
+    
+    print(f"\nModel: {analysis.n_layers} layers, {analysis.total_size_bytes / (1024**3):.2f} GB total")
+    print(f"Embeddings: {analysis.embedding_size / (1024**2):.1f} MiB (GPU {plan.embedding_gpu})")
+    print(f"Output layer: {analysis.output_size / (1024**2):.1f} MiB (GPU {plan.output_gpu})")
+    
+    print(f"\n{'─'*60}")
+    print("GPU ALLOCATION SUMMARY")
+    print(f"{'─'*60}")
+    
+    for gpu_idx, layers in enumerate(plan.layers_per_gpu):
+        if layers:
+            layer_range = f"{min(layers)}-{max(layers)}"
+        else:
+            layer_range = "none"
+        
+        budget = plan.gpu_budgets_mib[gpu_idx]
+        used = plan.vram_per_gpu_mib[gpu_idx]
+        pct = (used / budget * 100) if budget > 0 else 0
+        
+        print(f"  GPU {gpu_idx}: {len(layers):3d} layers (#{layer_range:>10}) | "
+              f"{used:8.1f} / {budget:8.1f} MiB ({pct:5.1f}%)")
+    
+    print(f"\n{'─'*60}")
+    print("TENSOR SPLIT FOR LLAMA.CPP")
+    print(f"{'─'*60}")
+    ts_str = ",".join(f"{t:.4f}" for t in plan.tensor_split)
+    print(f"  --tensor-split \"{ts_str}\"")
+    
+    # Also show rounded version
+    ts_rounded = ",".join(f"{t:.2f}" for t in plan.tensor_split)
+    print(f"  (rounded: \"{ts_rounded}\")")
+    
+    print(f"\n{'─'*60}")
+    print("LAYER SIZE LIST")
+    print(f"{'─'*60}")
+    print(f"  {'Layer':<8} {'Size (MiB)':<12} {'GPU':<6}")
+    print(f"  {'-'*8} {'-'*12} {'-'*6}")
+    
+    for alloc in plan.layer_allocations[:10]:  # First 10 layers
+        print(f"  {alloc.layer_index:<8} {alloc.size_mib:<12.2f} {alloc.assigned_gpu:<6}")
+    
+    if len(plan.layer_allocations) > 20:
+        print(f"  ... ({len(plan.layer_allocations) - 20} more layers) ...")
+    
+    for alloc in plan.layer_allocations[-10:]:  # Last 10 layers
+        if alloc.layer_index >= 10:  # Avoid duplicates
+            print(f"  {alloc.layer_index:<8} {alloc.size_mib:<12.2f} {alloc.assigned_gpu:<6}")
+    
+    print(f"{'='*60}\n")
+
+
 
 def analyze_gguf_model(model_path: str) -> ModelAnalysis:
     """
@@ -527,28 +654,55 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         print("Usage: python -m vram_llm.model_analyzer <model.gguf>")
+        print("  Optional env vars:")
+        print("    VRAM_LLM_RESERVE_MIB=512  - Reserve per GPU (default 512)")
+        print("    VRAM_LLM_LAYER_LOG=path   - Log file for layer details")
         sys.exit(1)
     
     reserve_mib = int(os.environ.get("VRAM_LLM_RESERVE_MIB", "512"))
     analysis = analyze_gguf_model(sys.argv[1])
     print_model_analysis(analysis)
     
-    # If torch is available, show a split based on live CUDA free memory.
-    torch_split, torch_layers_per_gpu, torch_gpus = analysis.get_torch_based_distribution(
-        reserve_mib=reserve_mib
-    )
+    # Try to get live GPU info via torch
+    torch_gpus = _list_torch_gpus()
+    
     if torch_gpus:
-        print(f"\n  PyTorch CUDA snapshot (reserve {reserve_mib} MiB per GPU):")
-        for g, layers in zip(torch_gpus, torch_layers_per_gpu):
-            print(f"    GPU {g.index} ({g.name}): free {g.free_mib} / total {g.total_mib} MiB -> {layers} layers")
-        print(f"  tensor_split: {[round(t, 3) for t in torch_split]}")
+        print(f"\n[vram-llm] Detected {len(torch_gpus)} GPU(s) via PyTorch:")
+        for g in torch_gpus:
+            print(f"  GPU {g.index}: {g.name} - {g.free_mib} / {g.total_mib} MiB free")
+        
+        # Use actual free VRAM for allocation
+        gpu_budgets = [g.free_mib for g in torch_gpus]
     else:
-        # Fallback example: fixed budgets to illustrate usage.
-        gpu_budgets = [24000, 24000, 12000]  # MiB
-        tensor_split, layers_per_gpu = analysis.get_layer_distribution(
-            gpu_budgets,
-            reserve_mib=reserve_mib,
-        )
-        print(f"\n  (Torch not available; using example budgets {gpu_budgets})")
-        print(f"  Suggested tensor_split: {tensor_split}")
-        print(f"  Layers per GPU: {layers_per_gpu}")
+        # Fallback to example budgets
+        print("\n[vram-llm] PyTorch/CUDA not available, using example GPU budgets")
+        gpu_budgets = [24000, 24000, 12000]  # Example: 2x 3090 Ti + 1x 4080
+    
+    # Calculate sequential allocation plan
+    print(f"\n[vram-llm] Calculating sequential layer allocation (reserve={reserve_mib} MiB/GPU)...")
+    plan = allocate_layers_sequential(analysis, gpu_budgets, reserve_mib=reserve_mib)
+    
+    # Print detailed allocation plan
+    print_allocation_plan(plan, analysis)
+    
+    # Also show the layer size list saved for reference
+    print("[vram-llm] Layer sizes saved to list:")
+    print(f"  Total layers: {len(plan.layer_allocations)}")
+    print(f"  Layer size range: {min(a.size_mib for a in plan.layer_allocations):.2f} - "
+          f"{max(a.size_mib for a in plan.layer_allocations):.2f} MiB")
+    
+    # Export layer list for external use
+    layer_list_file = Path(analysis.model_path).with_suffix('.layer_sizes.txt')
+    try:
+        with open(layer_list_file, 'w') as f:
+            f.write("# Layer allocation plan\n")
+            f.write(f"# Model: {analysis.model_path}\n")
+            f.write(f"# Reserve: {reserve_mib} MiB/GPU\n")
+            f.write(f"# tensor_split: {','.join(f'{t:.4f}' for t in plan.tensor_split)}\n")
+            f.write("#\n")
+            f.write("# layer_index, size_mib, assigned_gpu\n")
+            for alloc in plan.layer_allocations:
+                f.write(f"{alloc.layer_index}, {alloc.size_mib:.2f}, {alloc.assigned_gpu}\n")
+        print(f"  Layer list exported to: {layer_list_file}")
+    except Exception as e:
+        print(f"  (Could not export layer list: {e})")
