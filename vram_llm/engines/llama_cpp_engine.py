@@ -63,12 +63,16 @@ class LlamaCppEngine:
         seed: int = 0,
         verbose: bool = True,
         chat_format: Optional[str] = None,
+        skip_tensor_split_adjustment: bool = False,
     ) -> LoadedModel:
         """Load a GGUF model using llama-cpp-python.
 
         Args:
             plan: AllocationPlan computed from free VRAM.
             n_gpu_layers: -1 means "try to offload all layers". If this OOMs, reduce.
+            skip_tensor_split_adjustment: If True, skip the early-layer compensation.
+                Use this when tensor_split was computed by model_analyzer which
+                already accounts for layer sizes.
         """
         # Lazy import so CUDA_VISIBLE_DEVICES can be set in the CLI before we import llama_cpp
         from llama_cpp import Llama  # type: ignore
@@ -85,15 +89,18 @@ class LlamaCppEngine:
             total = sum(tensor_split)
             tensor_split = [w / total for w in tensor_split]
             
-            # IMPORTANT: Apply correction factors for VRAM overhead
-            # - KV cache takes ~500MB-2GB per GPU depending on context
-            # - Compute buffers take ~400MB per GPU
-            # - Early layers (on GPU 0) are typically 20-30% larger than average
-            # 
-            # We reduce GPU 0's proportion to account for:
-            # 1. Larger early layers (embeddings, first attention blocks)
-            # 2. Additional overhead that accumulates on main_gpu
-            if len(tensor_split) > 1:
+            # Apply early-layer compensation ONLY if not using smart allocation
+            # Smart allocation (model_analyzer) already accounts for actual layer sizes
+            if not skip_tensor_split_adjustment and len(tensor_split) > 1:
+                # IMPORTANT: Apply correction factors for VRAM overhead
+                # - KV cache takes ~500MB-2GB per GPU depending on context
+                # - Compute buffers take ~400MB per GPU
+                # - Early layers (on GPU 0) are typically 20-30% larger than average
+                # 
+                # We reduce GPU 0's proportion to account for:
+                # 1. Larger early layers (embeddings, first attention blocks)
+                # 2. Additional overhead that accumulates on main_gpu
+                
                 # Reserve extra headroom for GPU 0 (early layers are bigger)
                 # Reduce GPU 0 by 15%, redistribute to other GPUs
                 early_layer_penalty = 0.15
@@ -109,9 +116,11 @@ class LlamaCppEngine:
                 # Re-normalize to ensure sum is exactly 1.0
                 total = sum(tensor_split)
                 tensor_split = [w / total for w in tensor_split]
-            
-            if verbose:
-                print(f"[vram-llm] adjusted tensor_split (with early-layer compensation): {tensor_split}")
+                
+                if verbose:
+                    print(f"[vram-llm] adjusted tensor_split (with early-layer compensation): {tensor_split}")
+            elif skip_tensor_split_adjustment and verbose:
+                print(f"[vram-llm] using smart tensor_split (layer-size aware): {tensor_split}")
 
         # In row-split mode, llama.cpp may keep some allocations on main_gpu.
         # For heterogeneous GPUs, it's generally safer to keep the biggest-free GPU first (CUDA device 0),
